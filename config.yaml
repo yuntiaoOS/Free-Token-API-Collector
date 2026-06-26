@@ -71,7 +71,11 @@ sources:
 
   - type: forum
     request_delay_seconds: 2
-    max_topics_per_entry: 20
+    retry_count: 3
+    retry_backoff_seconds: 2
+    max_topics_per_entry: 30
+    max_pages_per_entry: 3
+    max_posts_per_topic: 50
     sites:
       - name: v2ex
         base_url: https://www.v2ex.com

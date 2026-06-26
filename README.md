@@ -230,21 +230,26 @@ ccswitch:
 | `github_readme` | 从指定 GitHub 仓库 README 提取 URL + Key |
 | `github_search` | 通过 GitHub Search 发现相关仓库并解析 README |
 | `web_aggregator` | 从配置的网页聚合站抓取 |
-| `forum` | 从 V2EX、Linux.do、NodeSeek 等论坛帖子提取 |
+| `forum` | 从 V2EX、Linux.do、NodeSeek 等论坛抓取（分页列表 + 全帖回复 + 智能提取） |
 
 论坛类站点若需登录，在对应 `sites` 条目下配置 `cookie`：
 
 ```yaml
-- name: linux.do
-  platform: discourse
-  cookie: "你的 Cookie 字符串"
-  entry_urls:
-    - https://linux.do/c/welfare/36
-    - https://linux.do/tags/c/welfare/36/183-tag/183
-    - https://linux.do/tag/mimo/1562/l/latest
-    - https://linux.do/search?q=free%20api
-    - https://linux.do/search?q=chatgpt%20api
-    - https://linux.do/c/ai/93
+- type: forum
+  max_pages_per_entry: 3
+  max_posts_per_topic: 50
+  max_topics_per_entry: 30
+  retry_count: 3
+  sites:
+    - name: linux.do
+      platform: discourse
+      cookie: "你的 Cookie 字符串"
+      max_topics_per_entry: 40
+      topic_title_include: [mimo, token, api]
+      topic_title_exclude: [网易云, epic]
+      entry_urls:
+        - https://linux.do/c/welfare/36
+        - https://linux.do/tag/mimo/1562/l/latest
 ```
 
 ### 调度与验证
@@ -306,6 +311,8 @@ free-token-api/
 ├── providers.example.yaml
 ├── requirements.txt
 └── sources/             # 各采集源实现
+    ├── token_extract.py   # 论坛文本智能提取 URL/Key
+    ├── forum_adapters.py  # V2EX / Discourse / NodeSeek 适配器
     ├── github_readme.py
     ├── github_search.py
     ├── web_aggregator.py
