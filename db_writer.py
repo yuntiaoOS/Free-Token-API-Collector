@@ -327,7 +327,7 @@ class CcSwitchWriter:
         at = vr.app_type
         base = vr.token.base_url.rstrip("/")
         key = vr.token.api_key
-        models = vr.discovered_models or vr.token.raw_models or []
+        models = vr.discovered_models or []
         default_model = models[0] if models else "gpt-4o"
 
         if at == "codex":

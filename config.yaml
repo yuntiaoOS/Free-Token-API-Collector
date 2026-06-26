@@ -29,6 +29,7 @@ validator:
   test_max_tokens: 32
   min_reply_chars: 1             # 回复内容最少字符数，低于此值视为失败
   prefer_codex: true            # 优先探测 Codex /responses，可用则写入 codex 分类
+  max_models_to_try: 12          # 验证时逐个尝试的模型数量上限
 
 ccswitch:
   # 留空则自动检测当前用户的 ~/.cc-switch/cc-switch.db

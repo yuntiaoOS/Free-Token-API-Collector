@@ -7,7 +7,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -74,6 +74,7 @@ class TokenValidator:
         self.test_max_tokens = validator_cfg.get("test_max_tokens", 32)
         self.min_reply_chars = validator_cfg.get("min_reply_chars", 1)
         self.prefer_codex = validator_cfg.get("prefer_codex", True)
+        self.max_models_to_try = validator_cfg.get("max_models_to_try", 12)
         self.user_agent = network_cfg.get("user_agent", "Mozilla/5.0")
 
     async def prepare_tokens(self, tokens: list[DiscoveredToken]) -> None:
@@ -88,13 +89,15 @@ class TokenValidator:
             headers={"User-Agent": self.user_agent},
         ) as client:
             for token in tokens:
-                if token.raw_models:
-                    continue
                 discovered = await self.discover_models(token, client=client)
-                if discovered:
-                    token.raw_models = discovered[:10]
-                elif not token.raw_models:
-                    token.raw_models = [self.test_model_openai]
+                scraped = list(token.raw_models)
+                merged: list[str] = []
+                for model in discovered + scraped:
+                    if model and model not in merged:
+                        merged.append(model)
+                if not merged:
+                    merged = [self.test_model_openai]
+                token.raw_models = merged[: self.max_models_to_try]
 
     async def validate_all(self, tokens: list[DiscoveredToken]) -> list[ValidationResult]:
         """Validate a batch of tokens concurrently and keep both success and failure results."""
@@ -187,6 +190,18 @@ class TokenValidator:
             headers.update(extra)
         return headers
 
+    def _candidate_models(self, token: DiscoveredToken, protocol: Protocol) -> list[str]:
+        fallback = self.test_model_openai
+        if protocol == Protocol.ANTHROPIC:
+            fallback = self.test_model_anthropic
+        models: list[str] = []
+        for model in token.raw_models:
+            if model and model not in models:
+                models.append(model)
+        if fallback not in models:
+            models.append(fallback)
+        return models[: self.max_models_to_try]
+
     async def _probe_openai_chat(
         self, client: httpx.AsyncClient, token: DiscoveredToken, vr: ValidationResult
     ) -> bool:
@@ -197,12 +212,18 @@ class TokenValidator:
                 "Content-Type": "application/json",
             }
         )
-        body = {
-            "model": token.raw_models[0] if token.raw_models else self.test_model_openai,
-            "messages": [{"role": "user", "content": self.test_prompt}],
-            "max_tokens": self.test_max_tokens,
-        }
-        return await self._send_probe(client, url, headers, body, vr, Protocol.OPENAI_CHAT)
+        for model in self._candidate_models(token, Protocol.OPENAI_CHAT):
+            body = {
+                "model": model,
+                "messages": [{"role": "user", "content": self.test_prompt}],
+                "max_tokens": self.test_max_tokens,
+            }
+            outcome = await self._send_probe(client, url, headers, body, vr, Protocol.OPENAI_CHAT)
+            if outcome == "success":
+                return True
+            if outcome != "next_model":
+                return False
+        return False
 
     async def _probe_openai_responses(
         self, client: httpx.AsyncClient, token: DiscoveredToken, vr: ValidationResult
@@ -214,12 +235,18 @@ class TokenValidator:
                 "Content-Type": "application/json",
             }
         )
-        body = {
-            "model": token.raw_models[0] if token.raw_models else self.test_model_openai,
-            "input": self.test_prompt,
-            "max_output_tokens": self.test_max_tokens,
-        }
-        return await self._send_probe(client, url, headers, body, vr, Protocol.OPENAI_RESPONSES)
+        for model in self._candidate_models(token, Protocol.OPENAI_RESPONSES):
+            body = {
+                "model": model,
+                "input": self.test_prompt,
+                "max_output_tokens": self.test_max_tokens,
+            }
+            outcome = await self._send_probe(client, url, headers, body, vr, Protocol.OPENAI_RESPONSES)
+            if outcome == "success":
+                return True
+            if outcome != "next_model":
+                return False
+        return False
 
     async def _probe_anthropic(
         self, client: httpx.AsyncClient, token: DiscoveredToken, vr: ValidationResult
@@ -232,12 +259,18 @@ class TokenValidator:
                 "Content-Type": "application/json",
             }
         )
-        body = {
-            "model": token.raw_models[0] if token.raw_models else self.test_model_anthropic,
-            "messages": [{"role": "user", "content": self.test_prompt}],
-            "max_tokens": self.test_max_tokens,
-        }
-        return await self._send_probe(client, url, headers, body, vr, Protocol.ANTHROPIC)
+        for model in self._candidate_models(token, Protocol.ANTHROPIC):
+            body = {
+                "model": model,
+                "messages": [{"role": "user", "content": self.test_prompt}],
+                "max_tokens": self.test_max_tokens,
+            }
+            outcome = await self._send_probe(client, url, headers, body, vr, Protocol.ANTHROPIC)
+            if outcome == "success":
+                return True
+            if outcome != "next_model":
+                return False
+        return False
 
     async def _send_probe(
         self,
@@ -247,7 +280,7 @@ class TokenValidator:
         body: dict[str, Any],
         vr: ValidationResult,
         protocol: Protocol,
-    ) -> bool:
+    ) -> Literal["success", "fail", "next_model"]:
         """Send a probe request and only accept protocol-shaped successful responses."""
         t0 = time.monotonic()
         try:
@@ -258,25 +291,35 @@ class TokenValidator:
             if response.status_code == 429:
                 vr.rate_limited = True
                 vr.error = "rate_limited"
-                return False
+                return "fail"
             if response.status_code in (401, 403):
+                err_text = ""
+                try:
+                    err_text = self._extract_error(response.json(), "")
+                except Exception:
+                    err_text = response.text[:200]
+                if self._is_model_access_denied(response.status_code, err_text):
+                    vr.error = f"model_access_denied:{body.get('model', '')}"
+                    return "next_model"
                 vr.error = f"auth_error_{response.status_code}"
-                return False
+                return "fail"
             if response.status_code >= 500:
                 vr.error = f"server_error_{response.status_code}"
-                return False
+                return "fail"
 
             try:
                 data = response.json()
             except Exception:
                 vr.error = f"non_json_response_{response.status_code}"
-                return False
+                return "fail"
 
             if protocol == Protocol.OPENAI_CHAT:
                 if isinstance(data.get("choices"), list) and data["choices"]:
-                    return self._mark_healthy(vr, protocol, data)
+                    return "success" if self._mark_healthy(vr, protocol, data) else "fail"
                 vr.error = self._extract_error(data, "missing_choices")
-                return False
+                if self._is_model_access_denied(response.status_code, vr.error):
+                    return "next_model"
+                return "fail"
 
             if protocol == Protocol.OPENAI_RESPONSES:
                 output = data.get("output")
@@ -286,26 +329,46 @@ class TokenValidator:
                     and isinstance(output, list)
                     and output
                 ):
-                    return self._mark_healthy(vr, protocol, data)
+                    return "success" if self._mark_healthy(vr, protocol, data) else "fail"
                 vr.error = self._extract_error(data, "invalid_responses_shape")
-                return False
+                if self._is_model_access_denied(response.status_code, vr.error):
+                    return "next_model"
+                return "fail"
 
             if protocol == Protocol.ANTHROPIC:
                 content = data.get("content")
                 if data.get("type") == "message" and isinstance(content, list):
-                    return self._mark_healthy(vr, protocol, data)
+                    return "success" if self._mark_healthy(vr, protocol, data) else "fail"
                 vr.error = self._extract_error(data, "missing_message_content")
-                return False
+                if self._is_model_access_denied(response.status_code, vr.error):
+                    return "next_model"
+                return "fail"
 
             vr.error = "unsupported_protocol"
-            return False
+            return "fail"
 
         except httpx.TimeoutException:
             vr.error = "timeout"
-            return False
+            return "fail"
         except Exception as e:
             vr.error = str(e)[:120]
-            return False
+            return "fail"
+
+    @staticmethod
+    def _is_model_access_denied(status_code: int, message: str) -> bool:
+        lowered = (message or "").lower()
+        hints = (
+            "no access to model",
+            "does not have access",
+            "model not found",
+            "invalid model",
+            "model_not_found",
+            "unsupported model",
+            "not allowed to use model",
+        )
+        if any(hint in lowered for hint in hints):
+            return True
+        return status_code == 404 and "model" in lowered
 
     @staticmethod
     def _extract_error(data: Any, fallback: str) -> str:
@@ -330,14 +393,11 @@ class TokenValidator:
         vr.protocol = protocol
         vr.is_healthy = True
         vr.sample_reply = reply.strip()[:500]
-        models: list[str] = []
-        model = data.get("model")
-        if isinstance(model, str) and model:
-            models.append(model)
-        for raw_model in vr.token.raw_models:
-            if raw_model and raw_model not in models:
-                models.append(raw_model)
-        vr.discovered_models = models
+        validated_model = data.get("model")
+        if isinstance(validated_model, str) and validated_model:
+            vr.discovered_models = [validated_model]
+        else:
+            vr.discovered_models = []
         return True
 
     @staticmethod
