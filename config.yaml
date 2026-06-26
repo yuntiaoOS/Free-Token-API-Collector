@@ -77,17 +77,45 @@ sources:
         base_url: https://www.v2ex.com
         platform: v2ex
         entry_urls:
-          - https://www.v2ex.com/go/openai
-          - https://www.v2ex.com/go/claude
-          - https://www.v2ex.com/go/cursor
-          - https://www.v2ex.com/search?q=chatgpt+api+key
-          - https://www.v2ex.com/search?q=free+claude+api
+          - https://www.v2ex.com/go/free
 
       - name: linux.do
         base_url: https://linux.do
         platform: discourse
         cookie: ""
+        max_topics_per_entry: 40
+        topic_title_include:
+          - mimo
+          - token
+          - api
+          - key
+          - gpt
+          - claude
+          - openai
+          - grok
+          - 模型
+          - 大模型
+          - deepseek
+          - gemini
+          - qwen
+          - codex
+          - 小米
+          - xiaomi
+          - 人工智能
+          - 白嫖
+        topic_title_exclude:
+          - 网易云
+          - epic
+          - 会员
+          - 机箱
+          - 白板
+          - happyhorse
+          - 积分
+          - windsurf
         entry_urls:
+          - https://linux.do/c/welfare/36
+          - https://linux.do/tags/c/welfare/36/183-tag/183
+          - https://linux.do/tag/mimo/1562/l/latest
           - https://linux.do/search?q=free%20api
           - https://linux.do/search?q=chatgpt%20api
           - https://linux.do/c/ai/93

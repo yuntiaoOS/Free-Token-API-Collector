@@ -239,7 +239,12 @@ ccswitch:
   platform: discourse
   cookie: "你的 Cookie 字符串"
   entry_urls:
+    - https://linux.do/c/welfare/36
+    - https://linux.do/tags/c/welfare/36/183-tag/183
+    - https://linux.do/tag/mimo/1562/l/latest
     - https://linux.do/search?q=free%20api
+    - https://linux.do/search?q=chatgpt%20api
+    - https://linux.do/c/ai/93
 ```
 
 ### 调度与验证

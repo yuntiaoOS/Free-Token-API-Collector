@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from dataclasses import dataclass
 from html import unescape
 from urllib.parse import urljoin, urlparse
 
@@ -40,6 +41,14 @@ _FAKE_KEY_PATTERNS = [
 
 _V2EX_TOPIC_RE = re.compile(r"/t/(\d+)")
 _NODESEEK_POST_RE = re.compile(r"/post-(\d+)-\d+")
+_DISCOURSE_TOPIC_HREF_RE = re.compile(r"^/t/[^/]+/\d+")
+_DISCOURSE_TOPIC_IN_HTML_RE = re.compile(r'href="(/t/[^"]+/\d+)"')
+
+
+@dataclass(frozen=True)
+class TopicEntry:
+    ref: str
+    title: str = ""
 
 
 def _is_fake_key(key: str) -> bool:
@@ -74,23 +83,37 @@ class ForumSource(BaseSource):
                 cookie = site.get("cookie", "")
                 source_tag = f"forum:{site_name}"
                 entry_urls = site.get("entry_urls", [base_url])
+                site_max_topics = site.get("max_topics_per_entry", max_topics)
+                title_include = [str(x).lower() for x in site.get("topic_title_include", [])]
+                title_exclude = [str(x).lower() for x in site.get("topic_title_exclude", [])]
 
                 log.info("Scraping forum %s (%s)", site_name, platform)
                 topic_refs: list[str] = []
                 seen_topics: set[str] = set()
+                skipped_by_title = 0
 
                 for entry_url in entry_urls:
                     full_entry = entry_url if entry_url.startswith("http") else urljoin(base_url + "/", entry_url.lstrip("/"))
                     try:
                         found = self._discover_topics(client, platform, base_url, full_entry, cookie)
-                        for ref in found[:max_topics]:
-                            if ref not in seen_topics:
-                                seen_topics.add(ref)
-                                topic_refs.append(ref)
+                        added = 0
+                        for entry in found:
+                            if added >= site_max_topics:
+                                break
+                            if entry.ref in seen_topics:
+                                continue
+                            if not self._title_matches_filters(entry.title, title_include, title_exclude):
+                                skipped_by_title += 1
+                                continue
+                            seen_topics.add(entry.ref)
+                            topic_refs.append(entry.ref)
+                            added += 1
                     except Exception as e:
                         log.warning("  Failed listing %s: %s", full_entry, e)
                     time.sleep(delay)
 
+                if skipped_by_title:
+                    log.info("  Skipped %d off-topic titles on %s", skipped_by_title, site_name)
                 log.info("  Discovered %d topics on %s", len(topic_refs), site_name)
                 for ref in topic_refs:
                     try:
@@ -133,9 +156,14 @@ class ForumSource(BaseSource):
         base_url: str,
         entry_url: str,
         cookie: str,
-    ) -> list[str]:
+    ) -> list[TopicEntry]:
         if platform == "discourse" and "/search" in entry_url:
             return self._discourse_search_topics(client, base_url, entry_url, cookie)
+
+        if platform == "discourse":
+            json_topics = self._discourse_json_listing_topics(client, base_url, entry_url, cookie)
+            if json_topics:
+                return json_topics
 
         response = self._request(client, entry_url, cookie)
         if response.status_code != 200:
@@ -144,17 +172,76 @@ class ForumSource(BaseSource):
 
         if platform == "v2ex":
             ids = _V2EX_TOPIC_RE.findall(response.text)
-            return [f"/t/{topic_id}" for topic_id in dict.fromkeys(ids)]
+            return [TopicEntry(ref=f"/t/{topic_id}") for topic_id in dict.fromkeys(ids)]
 
         if platform == "discourse":
-            slugs = re.findall(r'href="(/t/[^"]+/\d+)"', response.text)
-            return list(dict.fromkeys(slugs))
+            return self._discourse_html_listing_topics(response.text)
 
         if platform == "nodeseek":
             posts = _NODESEEK_POST_RE.findall(response.text)
-            return [f"/post-{post_id}-1" for post_id in dict.fromkeys(posts)]
+            return [TopicEntry(ref=f"/post-{post_id}-1") for post_id in dict.fromkeys(posts)]
 
         return []
+
+    @staticmethod
+    def _title_matches_filters(
+        title: str,
+        include: list[str],
+        exclude: list[str],
+    ) -> bool:
+        normalized = title.lower()
+        if exclude and any(keyword in normalized for keyword in exclude):
+            return False
+        if include and not any(keyword in normalized for keyword in include):
+            return False
+        return True
+
+    def _discourse_json_listing_topics(
+        self,
+        client,
+        base_url: str,
+        entry_url: str,
+        cookie: str,
+    ) -> list[TopicEntry]:
+        parsed = urlparse(entry_url)
+        json_url = f"{base_url}{parsed.path.rstrip('/')}.json"
+        response = self._request(client, json_url, cookie, accept_json=True)
+        if response.status_code != 200:
+            return []
+
+        data = response.json()
+        topics = data.get("topic_list", {}).get("topics", [])
+        entries: list[TopicEntry] = []
+        for topic in topics:
+            topic_id = topic.get("id")
+            slug = topic.get("slug")
+            if topic_id and slug:
+                entries.append(
+                    TopicEntry(
+                        ref=f"/t/{slug}/{topic_id}",
+                        title=str(topic.get("title") or ""),
+                    )
+                )
+        return entries
+
+    @staticmethod
+    def _discourse_html_listing_topics(html: str) -> list[TopicEntry]:
+        entries: list[TopicEntry] = []
+        seen: set[str] = set()
+        soup = BeautifulSoup(html, "lxml")
+        for link in soup.select('a[href*="/t/"]'):
+            href = (link.get("href") or "").split("?")[0]
+            if not _DISCOURSE_TOPIC_HREF_RE.match(href) or href in seen:
+                continue
+            seen.add(href)
+            title = link.get_text(strip=True)
+            entries.append(TopicEntry(ref=href, title=title))
+        if entries:
+            return entries
+
+        for ref in dict.fromkeys(_DISCOURSE_TOPIC_IN_HTML_RE.findall(html)):
+            entries.append(TopicEntry(ref=ref))
+        return entries
 
     def _discourse_search_topics(
         self,
@@ -162,7 +249,7 @@ class ForumSource(BaseSource):
         base_url: str,
         entry_url: str,
         cookie: str,
-    ) -> list[str]:
+    ) -> list[TopicEntry]:
         parsed = urlparse(entry_url)
         query = ""
         if parsed.query:
@@ -179,13 +266,18 @@ class ForumSource(BaseSource):
 
         data = response.json()
         topics = data.get("topics", [])
-        refs: list[str] = []
+        entries: list[TopicEntry] = []
         for topic in topics:
             topic_id = topic.get("id")
             slug = topic.get("slug")
             if topic_id and slug:
-                refs.append(f"/t/{slug}/{topic_id}")
-        return refs
+                entries.append(
+                    TopicEntry(
+                        ref=f"/t/{slug}/{topic_id}",
+                        title=str(topic.get("title") or ""),
+                    )
+                )
+        return entries
 
     def _fetch_topic_text(
         self,
