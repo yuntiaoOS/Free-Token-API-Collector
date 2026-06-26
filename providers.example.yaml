@@ -1,0 +1,13 @@
+providers:
+  - source: "manual:xiaomi-mimo"
+    base_url: "https://token-plan-cn.xiaomimimo.com/v1"
+    api_key: "REPLACE_WITH_REAL_KEY"
+    models:
+      - "mimo-v2.5"
+
+  - source: "manual:another-provider"
+    base_url: "https://example.com/v1"
+    api_key: "REPLACE_WITH_ANOTHER_KEY"
+    skip_discover_models: true
+    models:
+      - "gpt-4o-mini"

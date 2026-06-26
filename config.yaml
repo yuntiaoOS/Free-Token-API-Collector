@@ -21,11 +21,18 @@ scheduler:
 validator:
   max_concurrent: 10
   request_timeout_seconds: 10
+  discover_models: true
   test_model_openai: "gpt-4o"
   test_model_anthropic: "claude-sonnet-4-20250514"
+  # 写入 cc-switch 前发送真实问答，确认能正常回复（非仅连通性探测）
+  test_prompt: "请用一句话回答：1+1等于几？只回复数字或简短答案。"
+  test_max_tokens: 32
+  min_reply_chars: 1             # 回复内容最少字符数，低于此值视为失败
+  prefer_codex: true            # 优先探测 Codex /responses，可用则写入 codex 分类
 
 ccswitch:
-  db_path: "C:\\Users\\Administrator\\.cc-switch\\cc-switch.db"
+  # 留空则自动检测当前用户的 ~/.cc-switch/cc-switch.db
+  db_path: ""
   auto_category: "auto_discovered"
   never_overwrite: true
 
@@ -61,3 +68,42 @@ sources:
 
   - type: web_aggregator
     urls: []
+
+  - type: forum
+    request_delay_seconds: 2
+    max_topics_per_entry: 20
+    sites:
+      - name: v2ex
+        base_url: https://www.v2ex.com
+        platform: v2ex
+        entry_urls:
+          - https://www.v2ex.com/go/openai
+          - https://www.v2ex.com/go/claude
+          - https://www.v2ex.com/go/cursor
+          - https://www.v2ex.com/search?q=chatgpt+api+key
+          - https://www.v2ex.com/search?q=free+claude+api
+
+      - name: linux.do
+        base_url: https://linux.do
+        platform: discourse
+        cookie: ""
+        entry_urls:
+          - https://linux.do/search?q=free%20api
+          - https://linux.do/search?q=chatgpt%20api
+          - https://linux.do/c/ai/93
+
+      - name: nodeseek
+        base_url: https://www.nodeseek.com
+        platform: nodeseek
+        cookie: ""
+        entry_urls:
+          - https://www.nodeseek.com/board/tech
+          - https://www.nodeseek.com/search?query=free+api
+
+      - name: deepflood
+        base_url: https://www.deepflood.com
+        platform: nodeseek
+        cookie: ""
+        entry_urls:
+          - https://www.deepflood.com/
+          - https://www.deepflood.com/search?query=free+api

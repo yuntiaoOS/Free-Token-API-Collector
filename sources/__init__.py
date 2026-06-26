@@ -4,6 +4,7 @@ from .base import DiscoveredToken, BaseSource
 from .github_readme import GitHubReadmeSource
 from .github_search import GitHubSearchSource
 from .web_aggregator import WebAggregatorSource
+from .forum import ForumSource
 
 __all__ = [
     "DiscoveredToken",
@@ -11,4 +12,5 @@ __all__ = [
     "GitHubReadmeSource",
     "GitHubSearchSource",
     "WebAggregatorSource",
+    "ForumSource",
 ]

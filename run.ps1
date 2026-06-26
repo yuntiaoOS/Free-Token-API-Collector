@@ -16,7 +16,7 @@ $logFile = "logs\run_${timestamp}.log"
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host " Free Token API Collector" -ForegroundColor Cyan
-Write-Host " 采集免费AI Token -> 验证可用性 -> 写入cc-switch" -ForegroundColor Cyan
+Write-Host " 清除失效 Key -> 采集验证 -> 写入 cc-switch" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -24,24 +24,36 @@ Write-Host ""
 $python = Get-Command python -ErrorAction SilentlyContinue
 if (-not $python) {
     Write-Host "[ERROR] Python not found. Please install Python 3.10+" -ForegroundColor Red
-    Read-Host "Press Enter to exit"
+    if (-not $env:FREE_TOKEN_NONINTERACTIVE) {
+        Read-Host "Press Enter to exit"
+    }
     exit 1
 }
 
-# Check yaml module
-$yamlCheck = python -c "import yaml" 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "[INFO] Installing PyYAML..." -ForegroundColor Yellow
-    pip install pyyaml --quiet
+# Install dependencies
+$reqFile = Join-Path $scriptDir "requirements.txt"
+if (Test-Path $reqFile) {
+    Write-Host "[INFO] Checking dependencies..." -ForegroundColor Yellow
+    pip install -r $reqFile --quiet
 }
 
-# Run the collector
+# Run purge then collect (or pass through custom args)
 Write-Host "[START] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Green
 Write-Host ""
 
-python main.py 2>&1 | Tee-Object -FilePath $logFile
+if ($args.Count -eq 0) {
+    Write-Host "[STEP 1/2] Purging expired API keys from cc-switch..." -ForegroundColor Yellow
+    python main.py --purge 2>&1 | Tee-Object -FilePath $logFile
+    Write-Host ""
+    Write-Host "[STEP 2/2] Collecting and adding useful providers..." -ForegroundColor Yellow
+    python main.py 2>&1 | Tee-Object -FilePath $logFile -Append
+} else {
+    python main.py @args 2>&1 | Tee-Object -FilePath $logFile
+}
 
 Write-Host ""
 Write-Host "[DONE] Log saved to $logFile" -ForegroundColor Green
 Write-Host ""
-Read-Host "Press Enter to exit"
+if (-not $env:FREE_TOKEN_NONINTERACTIVE) {
+    Read-Host "Press Enter to exit"
+}
