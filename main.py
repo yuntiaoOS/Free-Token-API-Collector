@@ -95,7 +95,7 @@ def collect_all(config: dict) -> list[DiscoveredToken]:
                 log.warning("Unknown source type: %s", src_type)
                 continue
 
-            log.info("━━━ Collecting from %s ━━━", src.name)
+            log.info("--- Collecting from %s ---", src.name)
             tokens = src.collect()
             for t in tokens:
                 if t.uid not in seen_uids:
@@ -114,7 +114,7 @@ def validate_tokens(tokens: list[DiscoveredToken], config: dict) -> list:
     val_cfg = config.get("validator", {})
     validator = TokenValidator(network, val_cfg)
 
-    log.info("━━━ Validating %d tokens ━━━", len(tokens))
+    log.info("--- Validating %d tokens ---", len(tokens))
     results = asyncio.run(validator.validate_all(tokens))
     healthy_count = sum(1 for result in results if result.is_healthy)
     log.info("Healthy tokens: %d / %d", healthy_count, len(tokens))
@@ -129,7 +129,7 @@ def write_to_ccswitch(results: list, config: dict) -> dict[str, int]:
         auto_category=cs_cfg.get("auto_category", "auto_discovered"),
         never_overwrite=cs_cfg.get("never_overwrite", True),
     )
-    log.info("━━━ Writing to cc-switch ━━━")
+    log.info("--- Writing to cc-switch ---")
     summary = writer.sync_results(results)
     log.info(
         "Healthy writes=%d, failure updates=%d, skipped manual=%d, skipped unhealthy new=%d",
@@ -248,9 +248,9 @@ def cmd_purge(config: dict, args: argparse.Namespace) -> None:
     dry_run = args.dry_run
 
     if dry_run:
-        log.info("━━━ Dry-run purge (no database changes) ━━━")
+        log.info("--- Dry-run purge (no database changes) ---")
     else:
-        log.info("━━━ Purging expired API keys from cc-switch ━━━")
+        log.info("--- Purging expired API keys from cc-switch ---")
     log.info("Database: %s", db_path)
 
     already_expired = writer.list_expired_providers()
@@ -285,14 +285,15 @@ def cmd_purge(config: dict, args: argparse.Namespace) -> None:
         log.info("No auto-managed providers found in cc-switch.")
         return
 
-    log.info(
+        log.info(
         "Purge finished — validated=%d, kept=%d, removed_unhealthy=%d, "
-        "removed_already_expired=%d, skipped_manual=%d%s",
+        "removed_already_expired=%d, skipped_manual=%d, skipped_transient=%d%s",
         purge_summary["validated"],
         purge_summary["kept_healthy"],
         purge_summary["removed_unhealthy"],
         purge_summary["removed_already_expired"],
         purge_summary["skipped_manual"],
+        purge_summary.get("skipped_transient", 0),
         " (dry-run)" if dry_run else "",
     )
 

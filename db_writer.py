@@ -203,6 +203,7 @@ class CcSwitchWriter:
             "kept_healthy": 0,
             "removed_unhealthy": 0,
             "skipped_manual": 0,
+            "skipped_transient": 0,
         }
         for vr in results:
             category = str(vr.token.extra.get("category") or self.auto_category)
@@ -215,6 +216,15 @@ class CcSwitchWriter:
                 continue
 
             reason = vr.error or f"HTTP {vr.http_status}" or "validation_failed"
+            if self._is_transient_validation_failure(vr):
+                log.info(
+                    "  Skip purge %s [%s]: transient failure (%s)",
+                    vr.provider_id,
+                    vr.app_type,
+                    reason,
+                )
+                summary["skipped_transient"] += 1
+                continue
             if dry_run:
                 log.info(
                     "  [dry-run] Would remove %s [%s]: %s",
@@ -229,6 +239,20 @@ class CcSwitchWriter:
                 log.info("  Removed %s [%s]: %s", vr.provider_id, vr.app_type, reason)
                 summary["removed_unhealthy"] += 1
         return summary
+
+    @staticmethod
+    def _is_transient_validation_failure(vr: ValidationResult) -> bool:
+        """Do not purge providers that failed due to temporary upstream issues."""
+        if vr.rate_limited:
+            return True
+        err = (vr.error or "").lower()
+        transient_markers = (
+            "server_error_5",
+            "timeout",
+            "rate_limited",
+            "non_json_response",
+        )
+        return any(marker in err for marker in transient_markers)
 
     def purge_already_expired(self, *, dry_run: bool = False) -> int:
         """Physically delete providers already marked with category=expired."""

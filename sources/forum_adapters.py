@@ -227,13 +227,88 @@ class V2exAdapter(ForumAdapter):
         api_url = f"{self.base_url}/api/topics/show.json?id={topic_id}"
         response = self._request(api_url, accept_json=True)
         if response.status_code == 200:
-            return self._text_from_api(response.json(), max_posts=max_posts)
+            try:
+                text = self._text_from_topic_api(response.json())
+                replies_text = self._fetch_replies_from_api(
+                    topic_id,
+                    max_posts=max(0, max_posts - 1),
+                )
+                if replies_text:
+                    text = f"{text}\n{replies_text}" if text else replies_text
+                if text.strip():
+                    return text
+            except Exception as e:
+                log.debug("V2EX API parse failed for %s: %s", topic_ref, e)
 
         topic_url = f"{self.base_url}{topic_ref}"
         response = self._request(topic_url)
         if response.status_code != 200:
             raise RuntimeError(f"HTTP {response.status_code}")
         return self._text_from_html(response.text)
+
+    def _fetch_replies_from_api(self, topic_id: str, *, max_posts: int) -> str:
+        if max_posts <= 0:
+            return ""
+
+        chunks: list[str] = []
+        page = 1
+        while len(chunks) < max_posts:
+            url = f"{self.base_url}/api/replies/show.json?topic_id={topic_id}&page={page}"
+            response = self._request(url, accept_json=True)
+            if response.status_code != 200:
+                break
+
+            replies = self._unwrap_v2ex_list(response.json())
+            if not replies:
+                break
+
+            for reply in replies:
+                if not isinstance(reply, dict):
+                    continue
+                content = reply.get("content")
+                if content:
+                    chunks.append(str(content))
+                if len(chunks) >= max_posts:
+                    break
+
+            if len(replies) < 50:
+                break
+            page += 1
+            self._sleep()
+
+        return "\n".join(chunks)
+
+    @staticmethod
+    def _unwrap_v2ex_root(data) -> dict:
+        if isinstance(data, list) and data:
+            first = data[0]
+            return first if isinstance(first, dict) else {}
+        if isinstance(data, dict):
+            return data
+        return {}
+
+    @staticmethod
+    def _unwrap_v2ex_list(data) -> list:
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            replies = data.get("replies")
+            if isinstance(replies, list):
+                return [item for item in replies if isinstance(item, dict)]
+        return []
+
+    @staticmethod
+    def _text_from_topic_api(data) -> str:
+        root = V2exAdapter._unwrap_v2ex_root(data)
+        chunks: list[str] = []
+        if root.get("title"):
+            chunks.append(str(root["title"]))
+        if root.get("content"):
+            chunks.append(str(root["content"]))
+        content_rendered = root.get("content_rendered")
+        if content_rendered and not root.get("content"):
+            chunks.append(BeautifulSoup(str(content_rendered), "lxml").get_text(separator=" "))
+        return "\n".join(chunks)
 
     @staticmethod
     def _page_url(entry_url: str, page: int) -> str:
@@ -242,22 +317,6 @@ class V2exAdapter(ForumAdapter):
         params["p"] = [str(page)]
         query = urlencode(params, doseq=True)
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{query}"
-
-    @staticmethod
-    def _text_from_api(data: dict, *, max_posts: int) -> str:
-        chunks: list[str] = []
-        root = data[0] if isinstance(data, list) and data else data
-        if not isinstance(root, dict):
-            return ""
-        if root.get("title"):
-            chunks.append(str(root["title"]))
-        if root.get("content"):
-            chunks.append(str(root["content"]))
-        for reply in root.get("replies", [])[: max(0, max_posts - 1)]:
-            content = reply.get("content")
-            if content:
-                chunks.append(str(content))
-        return "\n".join(chunks)
 
     @staticmethod
     def _text_from_html(html: str) -> str:
