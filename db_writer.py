@@ -325,7 +325,12 @@ class CcSwitchWriter:
         from urllib.parse import urlparse
         host = urlparse(vr.token.base_url).netloc or vr.token.base_url[:40]
         source_short = vr.token.source.split("/")[-1] if "/" in vr.token.source else vr.token.source
-        return f"Auto | {host} ({source_short})"
+        protocol_tag = {
+            "openclaw": "OpenAI",
+            "claude": "Claude",
+            "codex": "Codex",
+        }.get(vr.app_type, vr.app_type)
+        return f"Auto | {host} [{protocol_tag}] ({source_short})"
 
     def _is_auto_managed_category(self, category: str) -> bool:
         return category in {self.auto_category, "expired"}

@@ -19,14 +19,15 @@ scheduler:
   max_consecutive_failures: 3
 
 validator:
-  max_concurrent: 10
+  max_concurrent: 5
   request_timeout_seconds: 10
   discover_models: true
   test_model_openai: "gpt-4o"
   test_model_anthropic: "claude-sonnet-4-20250514"
   # 写入 cc-switch 前发送真实问答，确认能正常回复（非仅连通性探测）
   test_prompt: "请用一句话回答：1+1等于几？只回复数字或简短答案。"
-  test_max_tokens: 32
+  test_max_tokens: 64
+  test_max_output_tokens: 128   # Codex /responses，MiMo 等 reasoning 模型需要更多 token
   min_reply_chars: 1             # 回复内容最少字符数，低于此值视为失败
   prefer_codex: true            # 优先探测 Codex /responses，可用则写入 codex 分类
   max_models_to_try: 12          # 验证时逐个尝试的模型数量上限
@@ -77,10 +78,36 @@ sources:
     max_topics_per_entry: 30
     max_pages_per_entry: 3
     max_posts_per_topic: 50
+    min_confidence: 50
     sites:
       - name: v2ex
         base_url: https://www.v2ex.com
         platform: v2ex
+        min_topic_id: 500000
+        max_topics_per_entry: 20
+        topic_title_include:
+          - mimo
+          - token
+          - api
+          - key
+          - gpt
+          - claude
+          - openai
+          - grok
+          - 模型
+          - 小米
+          - xiaomi
+        topic_title_exclude:
+          - 网易云
+          - epic
+          - 会员
+          - 机箱
+          - 白板
+          - 积分
+          - windsurf
+          - 送码
+        feed_urls:
+          - https://www.v2ex.com/feed/free.json
         entry_urls:
           - https://www.v2ex.com/go/free
 
@@ -88,7 +115,11 @@ sources:
         base_url: https://linux.do
         platform: discourse
         cookie: ""
+        request_delay_seconds: 4
         max_topics_per_entry: 40
+        feed_urls:
+          - https://linux.do/c/welfare/36.rss
+          # 子标签 RSS 常返回 406，改由福利区 RSS + 标题过滤 mimo
         topic_title_include:
           - mimo
           - token
@@ -108,6 +139,8 @@ sources:
           - xiaomi
           - 人工智能
           - 白嫖
+          - credits
+          - 分享
         topic_title_exclude:
           - 网易云
           - epic
@@ -117,13 +150,10 @@ sources:
           - happyhorse
           - 积分
           - windsurf
+          - 续费
+          - 套餐
         entry_urls:
-          - https://linux.do/c/welfare/36
-          - https://linux.do/tags/c/welfare/36/183-tag/183
-          - https://linux.do/tag/mimo/1562/l/latest
-          - https://linux.do/search?q=free%20api
-          - https://linux.do/search?q=chatgpt%20api
-          - https://linux.do/c/ai/93
+          - https://linux.do/tags/c/welfare/36/mimo/1562
 
       - name: nodeseek
         base_url: https://www.nodeseek.com

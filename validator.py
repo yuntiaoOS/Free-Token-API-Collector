@@ -72,6 +72,9 @@ class TokenValidator:
             "test_prompt", "请用一句话回答：1+1等于几？只回复数字或简短答案。"
         )
         self.test_max_tokens = validator_cfg.get("test_max_tokens", 32)
+        self.test_max_output_tokens = validator_cfg.get(
+            "test_max_output_tokens", max(self.test_max_tokens * 4, 128)
+        )
         self.min_reply_chars = validator_cfg.get("min_reply_chars", 1)
         self.prefer_codex = validator_cfg.get("prefer_codex", True)
         self.max_models_to_try = validator_cfg.get("max_models_to_try", 12)
@@ -150,9 +153,13 @@ class TokenValidator:
                 return vr
 
             known_app_type = str(token.extra.get("app_type") or "")
-            probe_order = self._probe_order_for_app_type(known_app_type)
+            strict_protocol = bool(known_app_type)
+            probe_order = self._probe_order_for_app_type(known_app_type, strict=strict_protocol)
+            if self._skip_anthropic_probe(token.base_url):
+                probe_order = tuple(name for name in probe_order if name != "anthropic")
 
             for probe_name in probe_order:
+                vr.rate_limited = False
                 if await self._run_probe(client, token, vr, probe_name):
                     return vr
             return vr
@@ -162,9 +169,22 @@ class TokenValidator:
             return ("responses", "openai_chat", "anthropic")
         return ("openai_chat", "anthropic", "responses")
 
-    def _probe_order_for_app_type(self, app_type: str) -> tuple[str, ...]:
+    @staticmethod
+    def _skip_anthropic_probe(base_url: str) -> bool:
+        lowered = base_url.lower()
+        if "/anthropic" in lowered or "claude" in lowered:
+            return False
+        openai_hints = (
+            "xiaomimimo", "mimo", "openai", "pekpik", "deepseek", "gptgod",
+            "openrouter", "siliconflow", "moonshot", "grok", "gemini",
+        )
+        return any(hint in lowered for hint in openai_hints) or lowered.rstrip("/").endswith("/v1")
+
+    def _probe_order_for_app_type(self, app_type: str, *, strict: bool = False) -> tuple[str, ...]:
         default = self._default_probe_order()
         preferred = self._APP_TYPE_PROBE_ORDER.get(app_type)
+        if preferred and strict:
+            return preferred
         if preferred:
             return preferred + tuple(name for name in default if name not in preferred)
         return default
@@ -195,6 +215,15 @@ class TokenValidator:
         if protocol == Protocol.ANTHROPIC:
             fallback = self.test_model_anthropic
         models: list[str] = []
+        host = token.base_url.lower()
+        if "xiaomimimo" in host or "mimo" in host:
+            for model in ("mimo-v2.5", "mimo-v2-flash", "mimo-v2.5-pro"):
+                if model not in models:
+                    models.append(model)
+        if protocol == Protocol.ANTHROPIC and ("xiaomimimo" in host or "mimo" in host):
+            for model in ("mimo-v2.5", "mimo-v2.5-pro"):
+                if model not in models:
+                    models.insert(0, model)
         for model in token.raw_models:
             if model and model not in models:
                 models.append(model)
@@ -239,19 +268,28 @@ class TokenValidator:
             body = {
                 "model": model,
                 "input": self.test_prompt,
-                "max_output_tokens": self.test_max_tokens,
+                "max_output_tokens": self.test_max_output_tokens,
             }
             outcome = await self._send_probe(client, url, headers, body, vr, Protocol.OPENAI_RESPONSES)
             if outcome == "success":
                 return True
+            if outcome == "unsupported_protocol":
+                return False
             if outcome != "next_model":
                 return False
         return False
 
+    @staticmethod
+    def _anthropic_messages_url(base_url: str) -> str:
+        normalized = base_url.rstrip("/")
+        if normalized.lower().endswith("/v1"):
+            return f"{normalized}/messages"
+        return f"{normalized}/v1/messages"
+
     async def _probe_anthropic(
         self, client: httpx.AsyncClient, token: DiscoveredToken, vr: ValidationResult
     ) -> bool:
-        url = f"{token.base_url.rstrip('/')}/messages"
+        url = self._anthropic_messages_url(token.base_url)
         headers = self._build_headers(
             {
                 "x-api-key": token.api_key,
@@ -280,7 +318,7 @@ class TokenValidator:
         body: dict[str, Any],
         vr: ValidationResult,
         protocol: Protocol,
-    ) -> Literal["success", "fail", "next_model"]:
+    ) -> Literal["success", "fail", "next_model", "unsupported_protocol"]:
         """Send a probe request and only accept protocol-shaped successful responses."""
         t0 = time.monotonic()
         try:
@@ -291,7 +329,12 @@ class TokenValidator:
             if response.status_code == 429:
                 vr.rate_limited = True
                 vr.error = "rate_limited"
+                if protocol == Protocol.OPENAI_RESPONSES:
+                    return "unsupported_protocol"
                 return "fail"
+            if response.status_code in (404, 405) and protocol == Protocol.OPENAI_RESPONSES:
+                vr.error = f"unsupported_protocol_{response.status_code}"
+                return "unsupported_protocol"
             if response.status_code in (401, 403):
                 err_text = ""
                 try:
@@ -311,17 +354,24 @@ class TokenValidator:
                 data = response.json()
             except Exception:
                 vr.error = f"non_json_response_{response.status_code}"
+                if response.status_code in (404, 405) and protocol == Protocol.OPENAI_RESPONSES:
+                    return "unsupported_protocol"
                 return "fail"
 
             if protocol == Protocol.OPENAI_CHAT:
                 if isinstance(data.get("choices"), list) and data["choices"]:
                     return "success" if self._mark_healthy(vr, protocol, data) else "fail"
                 vr.error = self._extract_error(data, "missing_choices")
+                if self._is_credit_exhausted(vr.error):
+                    return "fail"
                 if self._is_model_access_denied(response.status_code, vr.error):
                     return "next_model"
                 return "fail"
 
             if protocol == Protocol.OPENAI_RESPONSES:
+                output_text = data.get("output_text")
+                if isinstance(output_text, str) and output_text.strip():
+                    return "success" if self._mark_healthy(vr, protocol, data) else "fail"
                 output = data.get("output")
                 if (
                     data.get("object") == "response"
@@ -353,6 +403,21 @@ class TokenValidator:
         except Exception as e:
             vr.error = str(e)[:120]
             return "fail"
+
+    @staticmethod
+    def _is_credit_exhausted(message: str) -> bool:
+        lowered = (message or "").lower()
+        hints = (
+            "insufficient credits",
+            "never purchased credits",
+            "can only afford 0",
+            "no endpoints found",
+            "quota exceeded",
+            "balance",
+            "余额不足",
+            "额度",
+        )
+        return any(hint in lowered for hint in hints)
 
     @staticmethod
     def _is_model_access_denied(status_code: int, message: str) -> bool:
@@ -410,14 +475,20 @@ class TokenValidator:
                     message = choice.get("message")
                     if isinstance(message, dict):
                         content = message.get("content")
-                        if isinstance(content, str):
+                        if isinstance(content, str) and content.strip():
                             return content
+                        reasoning = message.get("reasoning_content")
+                        if isinstance(reasoning, str) and reasoning.strip():
+                            return reasoning
                     text = choice.get("text")
                     if isinstance(text, str):
                         return text
             return ""
 
         if protocol == Protocol.OPENAI_RESPONSES:
+            output_text = data.get("output_text")
+            if isinstance(output_text, str) and output_text.strip():
+                return output_text
             output = data.get("output")
             if isinstance(output, list):
                 parts: list[str] = []
@@ -443,10 +514,16 @@ class TokenValidator:
             if isinstance(content, list):
                 parts: list[str] = []
                 for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text":
                         text = block.get("text")
                         if isinstance(text, str) and text:
                             parts.append(text)
+                    if block.get("type") == "thinking":
+                        thinking = block.get("thinking")
+                        if isinstance(thinking, str) and thinking:
+                            parts.append(thinking)
                 return "".join(parts)
             return ""
 

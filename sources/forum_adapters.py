@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from html import unescape
@@ -16,7 +17,8 @@ log = logging.getLogger(__name__)
 
 _DISCOURSE_TOPIC_HREF_RE = re.compile(r"^/t/[^/]+/\d+")
 _DISCOURSE_TOPIC_IN_HTML_RE = re.compile(r'href="(/t/[^"]+/\d+)"')
-_V2EX_TOPIC_RE = re.compile(r"/t/(\d+)")
+_V2EX_TOPIC_HREF_RE = re.compile(r"^/t/(\d{6,})$")
+_V2EX_TOPIC_RE = re.compile(r"/t/(\d{6,})")
 _NODESEEK_POST_RE = re.compile(r"/post-(\d+)-\d+")
 
 
@@ -25,16 +27,26 @@ class TopicEntry:
     ref: str
     title: str = ""
     score: int = 0
+    prefetched_text: str = ""
 
 
 class ForumAdapter(ABC):
     platform: str
 
-    def __init__(self, base_url: str, cookie: str, request_fn, delay: float):
+    def __init__(
+        self,
+        base_url: str,
+        cookie: str,
+        request_fn,
+        delay: float,
+        site_config: dict | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.cookie = cookie
         self._request = request_fn
         self.delay = delay
+        self.site_config = site_config or {}
+        self._loaded_feeds: set[str] = set()
 
     @abstractmethod
     def discover(self, entry_url: str, *, max_pages: int, max_topics: int) -> list[TopicEntry]:
@@ -54,10 +66,35 @@ class DiscourseAdapter(ForumAdapter):
 
     def discover(self, entry_url: str, *, max_pages: int, max_topics: int) -> list[TopicEntry]:
         if "/search" in entry_url:
+            if not self.cookie:
+                return []
             return self._search_topics(entry_url, max_topics=max_topics)
+
+        feed_urls = list(self.site_config.get("feed_urls") or [])
+        rss_url = self._rss_url_for_entry(entry_url)
+        if rss_url and rss_url not in feed_urls:
+            feed_urls.append(rss_url)
 
         entries: list[TopicEntry] = []
         seen: set[str] = set()
+
+        for feed_url in feed_urls:
+            if feed_url in self._loaded_feeds:
+                continue
+            self._loaded_feeds.add(feed_url)
+            self._sleep()
+            for entry in self._discover_from_rss(feed_url, max_topics=max_topics):
+                if entry.ref in seen:
+                    continue
+                seen.add(entry.ref)
+                entries.append(entry)
+                if len(entries) >= max_topics:
+                    return entries
+
+        skip_html = not self.cookie and bool(self.site_config.get("feed_urls"))
+        if skip_html:
+            return entries
+
         for page in range(max_pages):
             page_entries = self._listing_page(entry_url, page=page)
             if not page_entries:
@@ -75,10 +112,15 @@ class DiscourseAdapter(ForumAdapter):
     def fetch_thread(self, topic_ref: str, *, max_posts: int) -> str:
         json_url = f"{self.base_url}{topic_ref}.json"
         response = self._request(json_url, accept_json=True)
-        if response.status_code != 200:
-            raise RuntimeError(f"HTTP {response.status_code}")
+        if response.status_code == 200:
+            return self._parse_json_thread(response.json(), max_posts=max_posts)
 
-        data = response.json()
+        rss_text = self._fetch_thread_from_rss(topic_ref)
+        if rss_text.strip():
+            return rss_text
+        raise RuntimeError(f"HTTP {response.status_code}")
+
+    def _parse_json_thread(self, data: dict, *, max_posts: int) -> str:
         post_stream = data.get("post_stream", {})
         posts = list(post_stream.get("posts", []))
         stream_ids = post_stream.get("stream", [])
@@ -100,6 +142,80 @@ class DiscourseAdapter(ForumAdapter):
             if raw:
                 chunks.append(raw)
         return "\n".join(chunks)
+
+    def _fetch_thread_from_rss(self, topic_ref: str) -> str:
+        rss_url = f"{self.base_url}{topic_ref.rstrip('/')}.rss"
+        response = self._request(rss_url, accept_rss=True)
+        if response.status_code != 200 or "<rss" not in response.text[:800].lower():
+            return ""
+        try:
+            root = ET.fromstring(response.text)
+        except ET.ParseError:
+            return ""
+
+        chunks: list[str] = []
+        for item in root.findall(".//item"):
+            title_el = item.find("title")
+            desc_el = item.find("description")
+            if title_el is not None and title_el.text:
+                chunks.append(title_el.text.strip())
+            if desc_el is not None and desc_el.text:
+                chunks.append(BeautifulSoup(unescape(desc_el.text), "lxml").get_text(separator="\n"))
+        return "\n".join(chunks)
+
+    @staticmethod
+    def _rss_url_for_entry(entry_url: str) -> str:
+        parsed = urlparse(entry_url)
+        path = parsed.path.rstrip("/")
+        if not path or path.endswith(".rss"):
+            return entry_url if entry_url.endswith(".rss") else ""
+        if "/search" in entry_url:
+            return ""
+        for suffix in ("/l/latest", "/latest"):
+            if path.endswith(suffix):
+                path = path[: -len(suffix)]
+                break
+        return f"{parsed.scheme}://{parsed.netloc}{path}.rss"
+
+    def _discover_from_rss(self, feed_url: str, *, max_topics: int) -> list[TopicEntry]:
+        response = self._request(feed_url, accept_rss=True)
+        if response.status_code != 200:
+            log.warning("  RSS feed failed %s: HTTP %s", feed_url, response.status_code)
+            return []
+        if "<rss" not in response.text[:800].lower():
+            log.warning("  RSS feed %s: response is not RSS (maybe blocked)", feed_url)
+            return []
+
+        entries: list[TopicEntry] = []
+        try:
+            root = ET.fromstring(response.text)
+        except ET.ParseError:
+            return []
+
+        for item in root.findall(".//item")[:max_topics]:
+            title_el = item.find("title")
+            link_el = item.find("link")
+            desc_el = item.find("description")
+            title = (title_el.text or "").strip() if title_el is not None else ""
+            link = (link_el.text or "").strip() if link_el is not None else ""
+            if not link:
+                continue
+            ref = urlparse(link).path
+            if not _DISCOURSE_TOPIC_HREF_RE.match(ref):
+                continue
+            description = desc_el.text if desc_el is not None and desc_el.text else ""
+            if description:
+                description = BeautifulSoup(description, "lxml").get_text(separator="\n")
+            entries.append(
+                TopicEntry(
+                    ref=ref,
+                    title=title,
+                    prefetched_text=description,
+                )
+            )
+        if entries:
+            log.info("  RSS feed %s -> %d topics", feed_url, len(entries))
+        return entries
 
     def _fetch_posts_by_ids(self, post_ids: list[int]) -> list[dict]:
         if not post_ids:
@@ -201,25 +317,93 @@ class V2exAdapter(ForumAdapter):
     platform = "v2ex"
 
     def discover(self, entry_url: str, *, max_pages: int, max_topics: int) -> list[TopicEntry]:
+        min_topic_id = int(self.site_config.get("min_topic_id", 500000))
+        feed_urls = list(self.site_config.get("feed_urls") or [])
+        if not feed_urls and "/go/" in entry_url:
+            node = urlparse(entry_url).path.rstrip("/").split("/")[-1]
+            feed_urls.append(f"{self.base_url}/feed/{node}.json")
+
         entries: list[TopicEntry] = []
         seen: set[str] = set()
+
+        for feed_url in feed_urls:
+            if feed_url in self._loaded_feeds:
+                continue
+            self._loaded_feeds.add(feed_url)
+            for entry in self._discover_from_json_feed(feed_url, min_topic_id=min_topic_id):
+                if entry.ref in seen:
+                    continue
+                seen.add(entry.ref)
+                entries.append(entry)
+                if len(entries) >= max_topics:
+                    return entries
+
         for page in range(1, max_pages + 1):
             page_url = entry_url if page == 1 else self._page_url(entry_url, page)
             response = self._request(page_url)
             if response.status_code != 200:
                 break
-            ids = _V2EX_TOPIC_RE.findall(response.text)
-            if not ids:
+            page_entries = self._discover_from_html(response.text, min_topic_id=min_topic_id)
+            if not page_entries:
                 break
-            for topic_id in dict.fromkeys(ids):
-                ref = f"/t/{topic_id}"
-                if ref in seen:
+            for entry in page_entries:
+                if entry.ref in seen:
                     continue
-                seen.add(ref)
-                entries.append(TopicEntry(ref=ref))
+                seen.add(entry.ref)
+                entries.append(entry)
                 if len(entries) >= max_topics:
                     return entries
             self._sleep()
+        return entries
+
+    def _discover_from_json_feed(self, feed_url: str, *, min_topic_id: int) -> list[TopicEntry]:
+        response = self._request(feed_url, accept_json=True)
+        if response.status_code != 200:
+            return []
+        try:
+            payload = response.json()
+        except Exception:
+            return []
+
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        entries: list[TopicEntry] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or item.get("id") or "")
+            match = _V2EX_TOPIC_HREF_RE.match(urlparse(url).path)
+            if not match:
+                continue
+            topic_id = int(match.group(1))
+            if topic_id < min_topic_id:
+                continue
+            content = str(item.get("content_text") or item.get("content_html") or "")
+            entries.append(
+                TopicEntry(
+                    ref=f"/t/{topic_id}",
+                    title=str(item.get("title") or ""),
+                    prefetched_text=content,
+                )
+            )
+        if entries:
+            log.info("  JSON feed %s -> %d topics", feed_url, len(entries))
+        return entries
+
+    @staticmethod
+    def _discover_from_html(html: str, *, min_topic_id: int) -> list[TopicEntry]:
+        entries: list[TopicEntry] = []
+        seen: set[str] = set()
+        soup = BeautifulSoup(html, "lxml")
+        for link in soup.select('a[href^="/t/"]'):
+            href = (link.get("href") or "").split("?")[0]
+            match = _V2EX_TOPIC_HREF_RE.match(href)
+            if not match or href in seen:
+                continue
+            if int(match.group(1)) < min_topic_id:
+                continue
+            seen.add(href)
+            title = link.get_text(strip=True)
+            entries.append(TopicEntry(ref=href, title=title))
         return entries
 
     def fetch_thread(self, topic_ref: str, *, max_posts: int) -> str:
@@ -370,14 +554,21 @@ class NodeSeekAdapter(ForumAdapter):
         return f"{entry_url}{sep}page={page}"
 
 
-def build_adapter(platform: str, base_url: str, cookie: str, request_fn, delay: float) -> ForumAdapter:
+def build_adapter(
+    platform: str,
+    base_url: str,
+    cookie: str,
+    request_fn,
+    delay: float,
+    site_config: dict | None = None,
+) -> ForumAdapter:
     adapters: dict[str, type[ForumAdapter]] = {
         "discourse": DiscourseAdapter,
         "v2ex": V2exAdapter,
         "nodeseek": NodeSeekAdapter,
     }
     cls = adapters.get(platform, V2exAdapter)
-    return cls(base_url, cookie, request_fn, delay)
+    return cls(base_url, cookie, request_fn, delay, site_config=site_config)
 
 
 def score_title(title: str, include: list[str], exclude: list[str]) -> int:

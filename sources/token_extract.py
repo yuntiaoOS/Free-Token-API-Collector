@@ -12,8 +12,10 @@ Improvements over the original version:
 
 from __future__ import annotations
 
+import base64
 import re
 from dataclasses import dataclass, field
+from urllib.parse import unquote
 from urllib.parse import urlparse
 
 from .base import DiscoveredToken
@@ -57,8 +59,8 @@ _KEY_RE = re.compile(
     r"xai-[A-Za-z0-9_\-]{20,}|"
     # Together / generic Bearer-style tokens (long alphanumeric)
     r"Bearer\s+[A-Za-z0-9_\-]{32,}|"
-    # Generic long hex tokens (e.g. sha256-based)
-    r"[A-Fa-f0-9]{40,}"
+    # Generic long hex tokens (e.g. sha256-based) — only in labelled/json paths
+    # r"[A-Fa-f0-9]{40,}"
     r")\b"
 )
 
@@ -102,13 +104,37 @@ _BASE_LABEL_RE = re.compile(
     r"\s*[:：]\s*[\"']?(https?://[^\s\"'<>]+)",
 )
 _KEY_LABEL_RE = re.compile(
-    r"(?i)(?:api[_\s-]?key|apikey|auth(?:_token)?|bearer|密钥|key|token)"
+    r"(?i)(?:api[_\s-]?key|apikey|auth(?:_token)?|bearer|密钥|key|token|key\d*)"
     r"\s*[:：=]\s*[\"']?("
     r"sk-[A-Za-z0-9_\-]{10,}|tp-[A-Za-z0-9_\-]{10,}|"
     r"sk-ant-[A-Za-z0-9_\-]{10,}|sk-or-v1-[A-Za-z0-9_\-]{10,}|"
     r"sk-proj-[A-Za-z0-9_\-]{10,}|AIza[A-Za-z0-9_\-]{20,}|"
-    r"gsk_[A-Za-z0-9_\-]{10,}|xai-[A-Za-z0-9_\-]{10,}"
+    r"gsk_[A-Za-z0-9_\-]{10,}|xai-[A-Za-z0-9_\-]{10,}|"
+    r"[A-Za-z0-9+/]{16,}={0,2}|"
+    r"(?:%[0-9A-Fa-f]{2}){4,}[A-Za-z0-9%_\-+=./]*"
     r")",
+)
+# Chinese forum style: key1：tp-xxx / 密钥2：sk-xxx
+_CN_KEY_LABEL_RE = re.compile(
+    r"(?i)(?:key|密钥)\s*\d*\s*[:：]\s*[\"']?("
+    r"sk-[A-Za-z0-9_\-]{10,}|tp-[A-Za-z0-9_\-]{10,}|"
+    r"sk-ant-[A-Za-z0-9_\-]{10,}|sk-or-v1-[A-Za-z0-9_\-]{10,}|"
+    r"sk-proj-[A-Za-z0-9_\-]{10,}|"
+    r"[A-Za-z0-9+/]{16,}={0,2}|"
+    r"(?:%[0-9A-Fa-f]{2}){4,}[A-Za-z0-9%_\-+=./]*"
+    r")",
+)
+# OpenAI / Anthropic 双协议（MiMo 等论坛常见格式）
+_OPENAI_PROTOCOL_RE = re.compile(
+    r"(?i)openai\s*接口(?:协议)?\s*[:：]\s*[\"']?(https?://[^\s\"'<>]+)"
+)
+_ANTHROPIC_PROTOCOL_RE = re.compile(
+    r"(?i)anthropic\s*接口(?:协议)?\s*[:：]\s*[\"']?(https?://[^\s\"'<>]+)"
+)
+# Base URL 兼容 OpenAI 接口协议：https://...
+_CN_BASE_LABEL_RE = re.compile(
+    r"(?i)(?:base\s*url|接口(?:地址|协议)?|反代|endpoint)"
+    r"[^:\n]{0,30}[:：]\s*[\"']?(https?://[^\s\"'<>]+)",
 )
 
 # Env-var style: KEY=sk-xxx or export KEY=sk-xxx
@@ -130,7 +156,15 @@ _JSON_BASE_RE = re.compile(
     re.IGNORECASE,
 )
 
-_CODE_BLOCK_RE = re.compile(r"`[^\n]*\n(.*?)`", re.DOTALL | re.IGNORECASE)
+_CODE_BLOCK_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+_B64_LABEL_RE = re.compile(
+    r"(?i)(?:base64|b64|编码|encrypt(?:ed)?)\s*[:：]\s*([A-Za-z0-9+/=\s]{12,})"
+)
+_URLENC_LABEL_RE = re.compile(
+    r"(?i)(?:url\s*decode|urldecode|解码|percent(?:\s*encode)?)\s*[:：]\s*([A-Za-z0-9%_\-+=./]{12,})"
+)
+_B64_BLOB_RE = re.compile(r"\b([A-Za-z0-9+/]{20,}={0,2})\b")
+_URLENC_BLOB_RE = re.compile(r"(?:%[0-9A-Fa-f]{2}){4,}[A-Za-z0-9%_\-+=./]*")
 _FAKE_KEY_PATTERNS = [
     re.compile(r"sk-(?:abcdef|123456|abcd1234|1234abcd|5678efgh|xxxx|your|test|demo|sample|example|placeholder|replace|change|insert)", re.I),
     re.compile(r"sk-[a-f0-9]{4,}$", re.IGNORECASE),
@@ -138,6 +172,114 @@ _FAKE_KEY_PATTERNS = [
     re.compile(r"sk-[x\*]{8,}", re.I),
     re.compile(r"sk-{1,}"),
 ]
+
+
+def _looks_like_decoded_payload(text: str) -> bool:
+    lowered = text.lower()
+    if re.search(r"\b(sk-|tp-|sk-ant-|sk-or-|sk-proj-|gsk_|xai-|AIza)", text):
+        return True
+    if re.search(r"https?://", text, re.I):
+        return True
+    if "api" in lowered and "key" in lowered:
+        return True
+    if "base_url" in lowered or "接口" in text or "mimo" in lowered:
+        return True
+    return False
+
+
+def _try_b64decode(value: str) -> str | None:
+    cleaned = re.sub(r"\s+", "", value.strip())
+    if len(cleaned) < 12 or len(cleaned) % 4 == 1:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9+/=]+", cleaned):
+        return None
+    padding = "=" * ((4 - len(cleaned) % 4) % 4)
+    try:
+        raw = base64.b64decode(cleaned + padding, validate=False)
+    except Exception:
+        return None
+    for encoding in ("utf-8", "gbk", "latin-1"):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if _looks_like_decoded_payload(text):
+            return text
+    return None
+
+
+def _try_urldecode(value: str, *, rounds: int = 3) -> str | None:
+    current = value.strip()
+    if "%" not in current:
+        return None
+    original = current
+    for _ in range(rounds):
+        try:
+            decoded = unquote(current)
+        except Exception:
+            break
+        if decoded == current:
+            break
+        current = decoded
+    if current != original and _looks_like_decoded_payload(current):
+        return current
+    return None
+
+
+def expand_encoded_content(text: str) -> str:
+    """Append decoded base64 / URL-encoded blobs so downstream extractors can match keys."""
+    if not text or not text.strip():
+        return text
+
+    extras: list[str] = []
+    seen: set[str] = set()
+
+    def add_extra(value: str) -> None:
+        value = value.strip()
+        if not value or value in seen:
+            return
+        seen.add(value)
+        extras.append(value)
+
+    for match in _B64_LABEL_RE.finditer(text):
+        decoded = _try_b64decode(match.group(1))
+        if decoded:
+            add_extra(decoded)
+
+    for match in _URLENC_LABEL_RE.finditer(text):
+        decoded = _try_urldecode(match.group(1))
+        if decoded:
+            add_extra(decoded)
+
+    for match in _B64_BLOB_RE.finditer(text):
+        candidate = match.group(1)
+        if candidate.startswith(("sk-", "tp-", "AIza")):
+            continue
+        decoded = _try_b64decode(candidate)
+        if decoded:
+            add_extra(decoded)
+
+    for match in _URLENC_BLOB_RE.finditer(text):
+        decoded = _try_urldecode(match.group(0))
+        if decoded:
+            add_extra(decoded)
+
+    for line in text.splitlines():
+        stripped = line.strip().strip("`\"'")
+        if not stripped:
+            continue
+        if stripped.count("%") >= 4:
+            decoded = _try_urldecode(stripped)
+            if decoded:
+                add_extra(decoded)
+        if re.fullmatch(r"[A-Za-z0-9+/=]{20,}", stripped):
+            decoded = _try_b64decode(stripped)
+            if decoded:
+                add_extra(decoded)
+
+    if not extras:
+        return text
+    return text + "\n\n--- decoded ---\n" + "\n".join(extras)
 
 
 def is_fake_key(key: str) -> bool:
@@ -155,9 +297,22 @@ def is_fake_key(key: str) -> bool:
     return False
 
 
+def infer_app_type(base_url: str) -> str:
+    """Infer cc-switch app_type from endpoint URL."""
+    lowered = base_url.lower()
+    if "/anthropic" in lowered:
+        return "claude"
+    if lowered.rstrip("/").endswith("/v1") or "/v1/" in lowered:
+        return "openclaw"
+    return ""
+
+
 def normalize_base_url(url: str) -> str:
     url = url.strip().rstrip(".,;:)}]\"'")
     url = url.rstrip("/")
+    lowered = url.lower()
+    if "/anthropic" in lowered:
+        return url
     # Strip known API path suffixes
     for suffix in ("/chat/completions", "/messages", "/responses", "/models", "/embeddings"):
         if url.lower().endswith(suffix):
@@ -176,12 +331,20 @@ def is_plausible_api_url(url: str) -> bool:
     lowered = url.lower()
     if not lowered.startswith("http"):
         return False
+    parsed = urlparse(url)
+    if parsed.fragment or "autosubmit" in lowered or "/dashboard" in lowered:
+        return False
+    if parsed.path.count("/") <= 1 and not _API_HOST_HINT_RE.search(url) and not lowered.endswith("/v1"):
+        # bare domain without API path, e.g. https://gptgod.online
+        if not _API_PATH_RE.search(url):
+            return False
     # Blacklist obvious non-API URLs
     blacklist = (
         "github.com", "imgur.", "gstatic.", "gravatar.",
         "linux.do", "v2ex.com", "nodeseek.com", "deepflood.com",
         "youtube.com", "twitter.com", "x.com", "reddit.com",
         "stackoverflow.com", "medium.com", "dev.to",
+        "vb.do", "gptgod.online", "openrouter.ai/docs",
     )
     if any(x in lowered for x in blacklist):
         return False
@@ -192,7 +355,6 @@ def is_plausible_api_url(url: str) -> bool:
     if lowered.endswith("/v1") or "/v1/" in lowered:
         return True
     # Generic API-looking domains with port (e.g. http://host:8080/v1)
-    parsed = urlparse(url)
     if parsed.port and parsed.path.rstrip("/") in ("", "/v1"):
         return True
     return False
@@ -219,6 +381,7 @@ class ExtractedPair:
     api_key: str
     models: list[str] = field(default_factory=list)
     confidence: int = 0
+    app_type: str = ""
     # Track positions for proximity scoring
     url_pos: int = -1
     key_pos: int = -1
@@ -240,10 +403,12 @@ class TokenExtractor:
         if not text or not text.strip():
             return []
 
+        text = expand_encoded_content(text)
         pairs: list[ExtractedPair] = []
         seen: set[str] = set()
 
         for strategy in (
+            self._from_dual_protocol,
             self._from_labelled_fields,
             self._from_env_vars,
             self._from_json_kv,
@@ -267,15 +432,66 @@ class TokenExtractor:
                 base_url=pair.base_url,
                 api_key=pair.api_key,
                 raw_models=pair.models[:10],
-                extra={"confidence": pair.confidence},
+                extra={
+                    "confidence": pair.confidence,
+                    **({"app_type": pair.app_type} if pair.app_type else {}),
+                },
             )
             for pair in pairs
         ]
+
+    def _from_dual_protocol(self, text: str) -> list[ExtractedPair]:
+        """One API Key shared by OpenAI + Anthropic endpoints (common on linux.do MiMo posts)."""
+        openai_urls = [normalize_base_url(m.group(1)) for m in _OPENAI_PROTOCOL_RE.finditer(text)]
+        anthropic_urls = [
+            normalize_base_url(m.group(1)) for m in _ANTHROPIC_PROTOCOL_RE.finditer(text)
+        ]
+        if not openai_urls and not anthropic_urls:
+            return []
+
+        keys: list[str] = []
+        for pattern in (_KEY_LABEL_RE, _CN_KEY_LABEL_RE):
+            for match in pattern.finditer(text):
+                key = match.group(1)
+                if not key.startswith(("sk-", "tp-", "sk-ant", "sk-or", "sk-proj", "gsk_", "xai-", "AIza")):
+                    key = _try_b64decode(key) or _try_urldecode(key) or key
+                if not is_fake_key(key) and key not in keys:
+                    keys.append(key)
+        if not keys:
+            return []
+
+        models = list(dict.fromkeys(_MODEL_RE.findall(text)))
+        results: list[ExtractedPair] = []
+        for key in keys:
+            for url in openai_urls:
+                if is_plausible_api_url(url):
+                    results.append(
+                        ExtractedPair(
+                            base_url=url,
+                            api_key=key,
+                            models=models,
+                            confidence=98,
+                            app_type="openclaw",
+                        )
+                    )
+            for url in anthropic_urls:
+                if is_plausible_api_url(url):
+                    results.append(
+                        ExtractedPair(
+                            base_url=url,
+                            api_key=key,
+                            models=models,
+                            confidence=98,
+                            app_type="claude",
+                        )
+                    )
+        return results
 
     def _from_labelled_fields(self, text: str) -> list[ExtractedPair]:
         """Extract from labelled fields like 'base_url: https://...' / 'api_key: sk-...'"""
         results: list[ExtractedPair] = []
         bases = [(normalize_base_url(m.group(1)), m.start()) for m in _BASE_LABEL_RE.finditer(text)]
+        bases += [(normalize_base_url(m.group(1)), m.start()) for m in _CN_BASE_LABEL_RE.finditer(text)]
         if not bases:
             bases = [
                 (normalize_base_url(m.group(0)), m.start())
@@ -283,16 +499,55 @@ class TokenExtractor:
                 if is_plausible_api_url(m.group(0))
             ]
         keys = [(m.group(1), m.start()) for m in _KEY_LABEL_RE.finditer(text) if not is_fake_key(m.group(1))]
-        models = list(dict.fromkeys(_MODEL_RE.findall(text)))
+        keys += [(m.group(1), m.start()) for m in _CN_KEY_LABEL_RE.finditer(text) if not is_fake_key(m.group(1))]
+        # Decode labelled values that are still encoded
+        decoded_keys: list[tuple[str, int]] = []
+        for key, pos in keys:
+            plain = key
+            if not plain.startswith(("sk-", "tp-", "sk-ant", "sk-or", "sk-proj", "gsk_", "xai-", "AIza")):
+                plain = _try_b64decode(key) or _try_urldecode(key) or key
+            if not is_fake_key(plain):
+                decoded_keys.append((plain, pos))
+        keys = decoded_keys
+        # dedupe keys by value keeping first position
+        seen_keys: set[str] = set()
+        unique_keys: list[tuple[str, int]] = []
+        for key, pos in keys:
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            unique_keys.append((key, pos))
         if not keys:
             return results
+        models = list(dict.fromkeys(_MODEL_RE.findall(text)))
+
+        def append_pair(base_url: str, base_pos: int, key: str, key_pos: int, confidence: int) -> None:
+            app_type = infer_app_type(base_url)
+            bonus = _proximity_score(base_pos, key_pos, len(text)) if base_pos >= 0 else 0
+            results.append(
+                ExtractedPair(
+                    base_url=base_url,
+                    api_key=key,
+                    models=models,
+                    confidence=confidence + min(bonus, 5),
+                    app_type=app_type,
+                    url_pos=base_pos,
+                    key_pos=key_pos,
+                )
+            )
+
+        if len(keys) == 1 and len(bases) > 1:
+            key, key_pos = keys[0]
+            for base_url, base_pos in bases:
+                append_pair(base_url, base_pos, key, key_pos, 92)
+            return results
+
         base_url, base_pos = bases[0] if bases else ("", 0)
         for key, key_pos in keys:
-            bonus = _proximity_score(base_pos, key_pos, len(text)) if base_pos >= 0 else 0
-            results.append(ExtractedPair(
-                base_url=base_url, api_key=key, models=models,
-                confidence=90 + min(bonus, 5), url_pos=base_pos, key_pos=key_pos,
-            ))
+            if len(bases) > 1:
+                nearest = min(bases, key=lambda item: abs(item[1] - key_pos))
+                base_url, base_pos = nearest
+            append_pair(base_url, base_pos, key, key_pos, 90)
         return results
 
     def _from_env_vars(self, text: str) -> list[ExtractedPair]:

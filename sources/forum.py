@@ -21,6 +21,7 @@ class ForumSource(BaseSource):
         self._extractor = TokenExtractor()
         self._retry_count = int(config.get("retry_count", 3))
         self._retry_backoff = float(config.get("retry_backoff_seconds", 2))
+        self._min_confidence = int(config.get("min_confidence", 50))
 
     @property
     def name(self) -> str:
@@ -40,7 +41,7 @@ class ForumSource(BaseSource):
         tokens: list[DiscoveredToken] = []
         seen_uids: set[str] = set()
 
-        with self._client() as client:
+        with self._client(timeout=max(self.timeout, 30)) as client:
             for site in sites:
                 site_name = site.get("name") or urlparse(site["base_url"]).netloc
                 base_url = site["base_url"].rstrip("/")
@@ -51,23 +52,34 @@ class ForumSource(BaseSource):
                 site_max_topics = int(site.get("max_topics_per_entry", max_topics))
                 site_max_pages = int(site.get("max_pages_per_entry", max_pages))
                 site_max_posts = int(site.get("max_posts_per_topic", max_posts))
+                site_min_confidence = int(site.get("min_confidence", self._min_confidence))
                 title_include = [str(x).lower() for x in site.get("topic_title_include", [])]
                 title_exclude = [str(x).lower() for x in site.get("topic_title_exclude", [])]
+                site_feed_urls = list(site.get("feed_urls") or [])
+                effective_entry_urls = list(entry_urls)
+                if not cookie and site_feed_urls:
+                    effective_entry_urls = [
+                        url for url in effective_entry_urls if "/search" not in url
+                    ]
+                    if not effective_entry_urls:
+                        effective_entry_urls = [site_feed_urls[0].removesuffix(".rss")]
 
+                site_delay = float(site.get("request_delay_seconds", delay))
                 adapter = build_adapter(
                     platform,
                     base_url,
                     cookie,
-                    lambda url, accept_json=False: self._request_with_retry(
-                        client, url, cookie, accept_json=accept_json
+                    lambda url, accept_json=False, accept_rss=False, referer=base_url: self._request_with_retry(
+                        client, url, cookie, accept_json=accept_json, accept_rss=accept_rss, referer=referer
                     ),
-                    delay,
+                    site_delay,
+                    site_config=site,
                 )
 
                 log.info("Scraping forum %s (%s)", site_name, platform)
                 topic_entries = self._collect_topics(
                     adapter,
-                    entry_urls,
+                    effective_entry_urls,
                     base_url,
                     title_include,
                     title_exclude,
@@ -76,11 +88,21 @@ class ForumSource(BaseSource):
                 )
                 log.info("  Queued %d topics on %s", len(topic_entries), site_name)
 
+                stats = {"topics": 0, "tokens": 0, "rss_only": 0}
                 for entry in topic_entries:
+                    stats["topics"] += 1
                     try:
-                        text = adapter.fetch_thread(entry.ref, max_posts=site_max_posts)
-                        found = self._extractor.extract(text, source_tag)
+                        text = self._fetch_topic_text(
+                            adapter, entry, site_max_posts, cookie=cookie
+                        )
+                        found = self._filter_by_confidence(
+                            self._extractor.extract(text, source_tag),
+                            site_min_confidence,
+                        )
                         if found:
+                            stats["tokens"] += len(found)
+                            if entry.prefetched_text and not cookie:
+                                stats["rss_only"] += 1
                             log.info(
                                 "  Topic %s — %d token(s)%s",
                                 entry.ref,
@@ -90,12 +112,58 @@ class ForumSource(BaseSource):
                         for token in found:
                             if token.uid not in seen_uids:
                                 seen_uids.add(token.uid)
+                                if entry.title:
+                                    token.extra["topic_title"] = entry.title
                                 tokens.append(token)
                     except Exception as e:
                         log.warning("  Failed topic %s: %s", entry.ref, e)
-                    time.sleep(delay)
+                    time.sleep(site_delay)
+
+                if stats["topics"]:
+                    log.info(
+                        "  %s summary: topics=%d, tokens=%d, rss_only=%d",
+                        site_name,
+                        stats["topics"],
+                        stats["tokens"],
+                        stats["rss_only"],
+                    )
 
         return tokens
+
+    @staticmethod
+    def _fetch_topic_text(adapter, entry: TopicEntry, max_posts: int, *, cookie: str = "") -> str:
+        parts: list[str] = []
+        if entry.title:
+            parts.append(entry.title)
+        if entry.prefetched_text.strip():
+            parts.append(entry.prefetched_text.strip())
+        # RSS 首楼常已含 Key；无 Cookie 时 JSON 接口会被 CF 拦截，直接用预取内容
+        if entry.prefetched_text.strip() and not cookie:
+            return "\n".join(parts)
+        try:
+            fetched = adapter.fetch_thread(entry.ref, max_posts=max_posts)
+            if fetched.strip():
+                parts.append(fetched.strip())
+        except Exception as e:
+            if not parts:
+                raise
+            log.debug("  Using prefetched content for %s (%s)", entry.ref, e)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _filter_by_confidence(
+        tokens: list[DiscoveredToken],
+        min_confidence: int,
+    ) -> list[DiscoveredToken]:
+        kept = [
+            token
+            for token in tokens
+            if int(token.extra.get("confidence", 0)) >= min_confidence
+        ]
+        dropped = len(tokens) - len(kept)
+        if dropped:
+            log.debug("  Filtered %d low-confidence token(s)", dropped)
+        return kept
 
     def _collect_topics(
         self,
@@ -136,7 +204,12 @@ class ForumSource(BaseSource):
                     continue
                 seen_refs.add(entry.ref)
                 ranked.append(
-                    TopicEntry(ref=entry.ref, title=entry.title, score=title_score)
+                    TopicEntry(
+                        ref=entry.ref,
+                        title=entry.title,
+                        score=title_score,
+                        prefetched_text=entry.prefetched_text,
+                    )
                 )
 
         if skipped_by_title:
@@ -145,10 +218,28 @@ class ForumSource(BaseSource):
         ranked.sort(key=lambda item: item.score, reverse=True)
         return ranked[:max_topics]
 
-    def _request_with_retry(self, client, url: str, cookie: str, *, accept_json: bool = False):
-        headers = self._headers()
-        if accept_json:
+    def _request_with_retry(
+        self,
+        client,
+        url: str,
+        cookie: str,
+        *,
+        accept_json: bool = False,
+        accept_rss: bool = False,
+        referer: str = "",
+    ):
+        headers = self._headers(
+            {
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Referer": referer or url,
+            }
+        )
+        if accept_rss:
+            headers["Accept"] = "application/rss+xml, application/xml, text/xml, */*"
+        elif accept_json:
             headers["Accept"] = "application/json, text/plain, */*"
+        else:
+            headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         if cookie:
             headers["Cookie"] = cookie
 
@@ -157,7 +248,7 @@ class ForumSource(BaseSource):
             response = client.get(url, headers=headers)
             last_response = response
             if response.status_code in (429, 500, 502, 503, 504):
-                wait = self._retry_backoff * (attempt + 1)
+                wait = self._retry_backoff * (attempt + 1) * (3 if response.status_code == 429 else 1)
                 log.debug("  Retry %s after HTTP %s (wait %.1fs)", url, response.status_code, wait)
                 time.sleep(wait)
                 continue
